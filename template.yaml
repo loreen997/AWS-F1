@@ -1,1 +1,291 @@
-hola
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Telemetria streaming: API Gateway -> Kinesis -> Lambda -> DynamoDB (sin Flink)."
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: acdc
+
+  StageName:
+    Type: String
+    Default: prod
+
+  StreamShardCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+
+  ArtifactsBucket:
+    Type: String
+    Default: artifactsbucketawsf1
+
+  LambdaCodeKey:
+    Type: String
+    Description: "Key del zip de la Lambda en S3 (ej: lambda/leaderboard.zip)"
+
+  TrackLengthMeters:
+    Type: Number
+    Default: 5891
+    Description: "Longitud del circuito en metros (Silverstone ~5891m)."
+
+  PartitionKeyMode:
+    Type: String
+    AllowedValues:
+      - race_id_header
+      - circuit
+    Default: race_id_header
+
+Conditions:
+  UseRaceIdHeader: !Equals [!Ref PartitionKeyMode, race_id_header]
+
+Resources:
+
+  ############################################################
+  # Kinesis Stream
+  ############################################################
+  TelemetryStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub "${ProjectName}-${StageName}-telemetry"
+      ShardCount: !Ref StreamShardCount
+      RetentionPeriodHours: 24
+
+  ############################################################
+  # DynamoDB
+  ############################################################
+  CarStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-${StageName}-car-state"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: race_id
+          AttributeType: S
+        - AttributeName: car_id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: race_id
+          KeyType: HASH
+        - AttributeName: car_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ############################################################
+  # API Gateway
+  ############################################################
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-${StageName}-telemetry"
+      RetentionInDays: 14
+
+  TelemetryApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-${StageName}-telemetry-api"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  TelemetryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TelemetryApi
+      ParentId: !GetAtt TelemetryApi.RootResourceId
+      PathPart: telemetry
+
+  ApiGatewayToKinesisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${StageName}-apigw-kinesis-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutRecordToKinesis
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: kinesis:PutRecord
+                Resource: !GetAtt TelemetryStream.Arn
+
+  TelemetryPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TelemetryApi
+      ResourceId: !Ref TelemetryResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.header.x-race-id: !If [UseRaceIdHeader, true, false]
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Credentials: !GetAtt ApiGatewayToKinesisRole.Arn
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:kinesis:action/PutRecord"
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: !Sub |
+            #set($body = $input.body)
+            #set($circuit = $input.path('$.circuit'))
+            #if($util.isBlank($circuit)) #set($circuit = "unknown") #end
+            #set($pk = $circuit)
+            #if($util.isNotBlank($input.params('x-race-id')))
+              #set($pk = $input.params('x-race-id'))
+            #end
+            {
+              "StreamName": "${TelemetryStream}",
+              "PartitionKey": "$util.escapeJavaScript($pk)",
+              "Data": "$util.base64Encode($body)"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: '{"status":"ok"}'
+          - StatusCode: 400
+            SelectionPattern: "4\\d{2}"
+            ResponseTemplates:
+              application/json: '{"status":"error"}'
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+
+  TelemetryDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: TelemetryPostMethod
+    Properties:
+      RestApiId: !Ref TelemetryApi
+
+  TelemetryStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TelemetryApi
+      DeploymentId: !Ref TelemetryDeployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogs.Arn
+        Format: '{ "requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength" }'
+
+  TelemetryApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${ProjectName}-${StageName}-telemetry-apikey"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref TelemetryApi
+          StageName: !Ref StageName
+
+  TelemetryUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-${StageName}-telemetry-usageplan"
+      ApiStages:
+        - ApiId: !Ref TelemetryApi
+          Stage: !Ref StageName
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 25
+      Quota:
+        Limit: 200000
+        Period: DAY
+
+  TelemetryUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref TelemetryApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref TelemetryUsagePlan
+
+  ############################################################
+  # Lambda
+  ############################################################
+  LeaderboardLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${StageName}-leaderboard-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadKinesisWriteDdb
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !GetAtt TelemetryStream.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt CarStateTable.Arn
+
+  LeaderboardLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${StageName}-leaderboard"
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !GetAtt LeaderboardLambdaRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          DDB_TABLE: !Ref CarStateTable
+          TRACK_LENGTH_M: !Ref TrackLengthMeters
+          DEFAULT_RACE_ID: !Sub "${ProjectName}-${StageName}-race"
+
+  KinesisToLambdaMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt TelemetryStream.Arn
+      FunctionName: !Ref LeaderboardLambda
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+      Enabled: true
+
+Outputs:
+  ApiInvokeUrl:
+    Value: !Sub "https://${TelemetryApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/telemetry"
+
+  ApiKeyValue:
+    Value: !Ref TelemetryApiKey
+
+  StreamName:
+    Value: !Ref TelemetryStream
+
+  CarStateTableName:
+    Value: !Ref CarStateTable
+
+  LambdaName:
+    Value: !Ref LeaderboardLambda
