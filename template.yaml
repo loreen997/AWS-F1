@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: "Telemetria streaming: API Gateway -> Kinesis -> Lambda -> DynamoDB (sin Flink)."
+Description: "Telemetria streaming: API Gateway -> Kinesis -> Lambda -> DynamoDB (Lambda placeholder)."
 
 Parameters:
   ProjectName:
@@ -15,28 +15,9 @@ Parameters:
     Default: 1
     MinValue: 1
 
-  ArtifactsBucket:
-    Type: String
-    Default: artifactsbucketawsf1
-
-  LambdaCodeKey:
-    Type: String
-    Description: "Key del zip de la Lambda en S3 (ej: lambda/leaderboard.zip)"
-
   TrackLengthMeters:
     Type: Number
     Default: 5891
-    Description: "Longitud del circuito en metros (Silverstone ~5891m)."
-
-  PartitionKeyMode:
-    Type: String
-    AllowedValues:
-      - race_id_header
-      - circuit
-    Default: race_id_header
-
-Conditions:
-  UseRaceIdHeader: !Equals [!Ref PartitionKeyMode, race_id_header]
 
 Resources:
 
@@ -74,12 +55,6 @@ Resources:
   ############################################################
   # API Gateway
   ############################################################
-  ApiLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-${StageName}-telemetry"
-      RetentionInDays: 14
-
   TelemetryApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -122,9 +97,6 @@ Resources:
       ResourceId: !Ref TelemetryResource
       HttpMethod: POST
       AuthorizationType: NONE
-      ApiKeyRequired: true
-      RequestParameters:
-        method.request.header.x-race-id: !If [UseRaceIdHeader, true, false]
       Integration:
         Type: AWS
         IntegrationHttpMethod: POST
@@ -133,29 +105,17 @@ Resources:
         PassthroughBehavior: NEVER
         RequestTemplates:
           application/json: !Sub |
-            #set($body = $input.body)
-            #set($circuit = $input.path('$.circuit'))
-            #if($util.isBlank($circuit)) #set($circuit = "unknown") #end
-            #set($pk = $circuit)
-            #if($util.isNotBlank($input.params('x-race-id')))
-              #set($pk = $input.params('x-race-id'))
-            #end
             {
               "StreamName": "${TelemetryStream}",
-              "PartitionKey": "$util.escapeJavaScript($pk)",
-              "Data": "$util.base64Encode($body)"
+              "PartitionKey": "default",
+              "Data": "$util.base64Encode($input.body)"
             }
         IntegrationResponses:
           - StatusCode: 200
             ResponseTemplates:
               application/json: '{"status":"ok"}'
-          - StatusCode: 400
-            SelectionPattern: "4\\d{2}"
-            ResponseTemplates:
-              application/json: '{"status":"error"}'
       MethodResponses:
         - StatusCode: 200
-        - StatusCode: 400
 
   TelemetryDeployment:
     Type: AWS::ApiGateway::Deployment
@@ -169,50 +129,9 @@ Resources:
       RestApiId: !Ref TelemetryApi
       DeploymentId: !Ref TelemetryDeployment
       StageName: !Ref StageName
-      MethodSettings:
-        - ResourcePath: "/*"
-          HttpMethod: "*"
-          LoggingLevel: INFO
-          DataTraceEnabled: false
-          MetricsEnabled: true
-          ThrottlingBurstLimit: 50
-          ThrottlingRateLimit: 25
-      AccessLogSetting:
-        DestinationArn: !GetAtt ApiLogs.Arn
-        Format: '{ "requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength" }'
-
-  TelemetryApiKey:
-    Type: AWS::ApiGateway::ApiKey
-    Properties:
-      Name: !Sub "${ProjectName}-${StageName}-telemetry-apikey"
-      Enabled: true
-      StageKeys:
-        - RestApiId: !Ref TelemetryApi
-          StageName: !Ref StageName
-
-  TelemetryUsagePlan:
-    Type: AWS::ApiGateway::UsagePlan
-    Properties:
-      UsagePlanName: !Sub "${ProjectName}-${StageName}-telemetry-usageplan"
-      ApiStages:
-        - ApiId: !Ref TelemetryApi
-          Stage: !Ref StageName
-      Throttle:
-        BurstLimit: 50
-        RateLimit: 25
-      Quota:
-        Limit: 200000
-        Period: DAY
-
-  TelemetryUsagePlanKey:
-    Type: AWS::ApiGateway::UsagePlanKey
-    Properties:
-      KeyId: !Ref TelemetryApiKey
-      KeyType: API_KEY
-      UsagePlanId: !Ref TelemetryUsagePlan
 
   ############################################################
-  # Lambda
+  # Lambda Role
   ############################################################
   LeaderboardLambdaRole:
     Type: AWS::IAM::Role
@@ -243,27 +162,34 @@ Resources:
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
-                  - dynamodb:GetItem
                 Resource: !GetAtt CarStateTable.Arn
 
+  ############################################################
+  # Lambda Placeholder
+  ############################################################
   LeaderboardLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${ProjectName}-${StageName}-leaderboard"
       Runtime: python3.11
-      Handler: app.lambda_handler
+      Handler: index.lambda_handler
       Role: !GetAtt LeaderboardLambdaRole.Arn
       Timeout: 10
       MemorySize: 256
       Code:
-        S3Bucket: !Ref ArtifactsBucket
-        S3Key: !Ref LambdaCodeKey
+        ZipFile: |
+          def lambda_handler(event, context):
+              print("Placeholder Lambda ejecutada")
+              print(event)
+              return {"status": "ok"}
       Environment:
         Variables:
           DDB_TABLE: !Ref CarStateTable
           TRACK_LENGTH_M: !Ref TrackLengthMeters
-          DEFAULT_RACE_ID: !Sub "${ProjectName}-${StageName}-race"
 
+  ############################################################
+  # Kinesis -> Lambda
+  ############################################################
   KinesisToLambdaMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
@@ -277,9 +203,6 @@ Resources:
 Outputs:
   ApiInvokeUrl:
     Value: !Sub "https://${TelemetryApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/telemetry"
-
-  ApiKeyValue:
-    Value: !Ref TelemetryApiKey
 
   StreamName:
     Value: !Ref TelemetryStream
