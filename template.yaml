@@ -1,217 +1,245 @@
-AWSTemplateFormatVersion: "2010-09-09"
+AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  F1 Real-time infra (no pipeline, no inline lambda code):
-  API Gateway -> Ingest Lambda -> Kinesis (input)
-  -> Kinesis Data Analytics (Flink) -> Kinesis (output)
-  -> Consumer Lambda -> DynamoDB + AppSync (subscriptions via mutation)
+  Telemetria streaming: API Gateway -> Kinesis (1 tick) -> Lambda (ranking + gaps) -> DynamoDB (estado actual).
+  Sin Flink. Lambda consume desde Kinesis.
 
 Parameters:
   ProjectName:
     Type: String
-    Default: f1-realtime
-
+    Default: acdc
   StageName:
     Type: String
     Default: prod
 
-  # Artifact locations (your pipeline uploads here)
-  ArtifactBucket:
-    Type: String
-    Description: S3 bucket where pipeline stores build artifacts (lambda zips + flink artifact)
-
-  IngestLambdaS3Key:
-    Type: String
-    Default: f1-realtime/lambdas/ingest.zip
-    Description: S3 key for ingest lambda zip
-
-  ConsumerLambdaS3Key:
-    Type: String
-    Default: f1-realtime/lambdas/consumer.zip
-    Description: S3 key for consumer lambda zip
-
-  FlinkArtifactS3Key:
-    Type: String
-    Default: f1-realtime/flink/flink-app.zip
-    Description: S3 key for flink application artifact (zip/jar)
-
-  IngestLambdaRuntime:
-    Type: String
-    Default: python3.12
-  IngestLambdaHandler:
-    Type: String
-    Default: index.handler
-
-  ConsumerLambdaRuntime:
-    Type: String
-    Default: python3.12
-  ConsumerLambdaHandler:
-    Type: String
-    Default: index.handler
-
-  InputStreamShards:
+  StreamShardCount:
     Type: Number
     Default: 1
     MinValue: 1
 
-  OutputStreamShards:
+  # Bucket de artefactos (tu caso: artifactsbucketawsf1)
+  ArtifactsBucket:
+    Type: String
+    Default: artifactsbucketawsf1
+
+  # ZIP de la Lambda subido por tu pipeline a S3
+  LambdaCodeKey:
+    Type: String
+    Description: Key del zip de la Lambda en S3 (ej: lambda/leaderboard.zip)
+
+  # Longitud circuito en metros (para gap_m = delta_progress * track_length_m)
+  TrackLengthMeters:
     Type: Number
-    Default: 1
-    MinValue: 1
+    Default: 5891
+    Description: Longitud del circuito en metros (Silverstone ~5891m, cámbialo si procede).
+
+  PartitionKeyMode:
+    Type: String
+    AllowedValues: ["race_id_header", "circuit"]
+    Default: "race_id_header"
+    Description: >
+      race_id_header = usa header x-race-id como partition key.
+      circuit = usa $.circuit.
+
+Conditions:
+  UseRaceIdHeader: !Equals [!Ref PartitionKeyMode, "race_id_header"]
 
 Resources:
-  ############################
-  # Kinesis Streams
-  ############################
-  InputStream:
+  ############################################################
+  # Kinesis Data Streams
+  ############################################################
+  TelemetryStream:
     Type: AWS::Kinesis::Stream
     Properties:
-      Name: !Sub "${ProjectName}-input"
-      ShardCount: !Ref InputStreamShards
+      Name: !Sub "${ProjectName}-${StageName}-telemetry"
+      ShardCount: !Ref StreamShardCount
       RetentionPeriodHours: 24
 
-  OutputStream:
-    Type: AWS::Kinesis::Stream
-    Properties:
-      Name: !Sub "${ProjectName}-output"
-      ShardCount: !Ref OutputStreamShards
-      RetentionPeriodHours: 24
-
-  ############################
-  # DynamoDB (current state)
-  ############################
-  CurrentStateTable:
+  ############################################################
+  # DynamoDB: estado actual por coche
+  ############################################################
+  CarStateTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "${ProjectName}-current-state"
+      TableName: !Sub "${ProjectName}-${StageName}-car-state"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: pk
+        - AttributeName: race_id
           AttributeType: S
-        - AttributeName: sk
-          AttributeType: S
+        - AttributeName: car_id
+          AttributeType: N
       KeySchema:
-        - AttributeName: pk
+        - AttributeName: race_id
           KeyType: HASH
-        - AttributeName: sk
+        - AttributeName: car_id
           KeyType: RANGE
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
-  ############################
-  # AppSync (subscriptions)
-  ############################
-  GraphQLApi:
-    Type: AWS::AppSync::GraphQLApi
+  ############################################################
+  # API Gateway
+  ############################################################
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
     Properties:
-      Name: !Sub "${ProjectName}-appsync"
-      AuthenticationType: API_KEY
-      XrayEnabled: true
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-${StageName}-telemetry"
+      RetentionInDays: 14
 
-  GraphQLApiKey:
-    Type: AWS::AppSync::ApiKey
+  TelemetryApi:
+    Type: AWS::ApiGateway::RestApi
     Properties:
-      ApiId: !GetAtt GraphQLApi.ApiId
-      Expires: 1893456000 # 2030-01-01
+      Name: !Sub "${ProjectName}-${StageName}-telemetry-api"
+      EndpointConfiguration:
+        Types: [REGIONAL]
 
-  GraphQLSchema:
-    Type: AWS::AppSync::GraphQLSchema
+  TelemetryResource:
+    Type: AWS::ApiGateway::Resource
     Properties:
-      ApiId: !GetAtt GraphQLApi.ApiId
-      Definition: |
-        type LeaderboardUpdate {
-          race_id: String!
-          payload: AWSJSON!
-          updatedAt: AWSDateTime!
-        }
+      RestApiId: !Ref TelemetryApi
+      ParentId: !GetAtt TelemetryApi.RootResourceId
+      PathPart: telemetry
 
-        type Mutation {
-          updateLeaderboard(race_id: String!, payload: AWSJSON!): LeaderboardUpdate!
-        }
-
-        type Subscription {
-          onLeaderboardUpdated(race_id: String!): LeaderboardUpdate
-            @aws_subscribe(mutations: ["updateLeaderboard"])
-        }
-
-        type Query {
-          ping: String
-        }
-
-        schema {
-          query: Query
-          mutation: Mutation
-          subscription: Subscription
-        }
-
-  NoneDataSource:
-    Type: AWS::AppSync::DataSource
-    Properties:
-      ApiId: !GetAtt GraphQLApi.ApiId
-      Name: NoneDS
-      Type: NONE
-
-  MutationResolverUpdateLeaderboard:
-    Type: AWS::AppSync::Resolver
-    DependsOn:
-      - GraphQLSchema
-    Properties:
-      ApiId: !GetAtt GraphQLApi.ApiId
-      TypeName: Mutation
-      FieldName: updateLeaderboard
-      DataSourceName: !GetAtt NoneDataSource.Name
-      RequestMappingTemplate: |
-        {
-          "version": "2017-02-28",
-          "payload": {
-            "race_id": $util.toJson($ctx.args.race_id),
-            "payload": $util.toJson($ctx.args.payload),
-            "updatedAt": $util.time.nowISO8601()
-          }
-        }
-      ResponseMappingTemplate: |
-        $util.toJson($ctx.result)
-
-  ############################
-  # IAM Roles
-  ############################
-  IngestLambdaRole:
+  ApiGatewayToKinesisRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ProjectName}-ingest-lambda-role"
+      RoleName: !Sub "${ProjectName}-${StageName}-apigw-kinesis-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: apigateway.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: PutToKinesisInput
+        - PolicyName: PutRecordToKinesis
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action:
-                  - kinesis:PutRecord
-                  - kinesis:PutRecords
-                Resource: !GetAtt InputStream.Arn
+                Action: kinesis:PutRecord
+                Resource: !GetAtt TelemetryStream.Arn
 
-  ConsumerLambdaRole:
+  TelemetryPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TelemetryApi
+      ResourceId: !Ref TelemetryResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.header.x-race-id: !If [UseRaceIdHeader, true, false]
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Credentials: !GetAtt ApiGatewayToKinesisRole.Arn
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:kinesis:action/PutRecord"
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          application/json: !Sub |
+            #set($body = $input.body)
+            #set($circuit = $input.path('$.circuit'))
+            #if($util.isBlank($circuit)) #set($circuit = "unknown") #end
+
+            #set($pk = $circuit)
+            #if($util.isNotBlank($input.params('x-race-id')))
+              #set($pk = $input.params('x-race-id'))
+            #end
+
+            {
+              "StreamName": "${TelemetryStream}",
+              "PartitionKey": "$util.escapeJavaScript($pk)",
+              "Data": "$util.base64Encode($body)"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                {"status":"ok"}
+          - StatusCode: 400
+            SelectionPattern: "4\\d{2}"
+            ResponseTemplates:
+              application/json: |
+                {"status":"error"}
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+
+  TelemetryDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: TelemetryPostMethod
+    Properties:
+      RestApiId: !Ref TelemetryApi
+
+  TelemetryStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TelemetryApi
+      DeploymentId: !Ref TelemetryDeployment
+      StageName: !Ref StageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogs.Arn
+        Format: |
+          { "requestId":"$context.requestId", "ip":"$context.identity.sourceIp",
+            "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod",
+            "resourcePath":"$context.resourcePath", "status":"$context.status",
+            "responseLength":"$context.responseLength" }
+
+  TelemetryApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${ProjectName}-${StageName}-telemetry-apikey"
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref TelemetryApi
+          StageName: !Ref TelemetryStage
+
+  TelemetryUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-${StageName}-telemetry-usageplan"
+      ApiStages:
+        - ApiId: !Ref TelemetryApi
+          Stage: !Ref TelemetryStage
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 25
+      Quota:
+        Limit: 200000
+        Period: DAY
+
+  TelemetryUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref TelemetryApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref TelemetryUsagePlan
+
+  ############################################################
+  # Lambda consumer (lee Kinesis y escribe DynamoDB)
+  ############################################################
+  LeaderboardLambdaRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${ProjectName}-consumer-lambda-role"
+      RoleName: !Sub "${ProjectName}-${StageName}-leaderboard-lambda-role"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: ReadOutputWriteDdb
+        - PolicyName: ReadKinesisWriteDdb
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -221,213 +249,57 @@ Resources:
                   - kinesis:GetShardIterator
                   - kinesis:DescribeStream
                   - kinesis:ListShards
-                Resource: !GetAtt OutputStream.Arn
+                Resource: !GetAtt TelemetryStream.Arn
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
-                  - dynamodb:BatchWriteItem
-                Resource: !GetAtt CurrentStateTable.Arn
+                  - dynamodb:GetItem
+                Resource: !GetAtt CarStateTable.Arn
 
-  KinesisAnalyticsRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${ProjectName}-kda-role"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: kinesisanalytics.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: KdaReadWriteKinesis
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - kinesis:DescribeStream
-                  - kinesis:GetShardIterator
-                  - kinesis:GetRecords
-                  - kinesis:ListShards
-                Resource: !GetAtt InputStream.Arn
-              - Effect: Allow
-                Action:
-                  - kinesis:DescribeStream
-                  - kinesis:PutRecord
-                  - kinesis:PutRecords
-                Resource: !GetAtt OutputStream.Arn
-              - Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: "*"
-
-  ############################
-  # Lambdas (code comes from artifact bucket)
-  ############################
-  IngestLambda:
+  LeaderboardLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${ProjectName}-ingest"
-      Runtime: !Ref IngestLambdaRuntime
-      Handler: !Ref IngestLambdaHandler
-      Role: !GetAtt IngestLambdaRole.Arn
-      Timeout: 5
+      FunctionName: !Sub "${ProjectName}-${StageName}-leaderboard"
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !GetAtt LeaderboardLambdaRole.Arn
+      Timeout: 10
       MemorySize: 256
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref LambdaCodeKey
       Environment:
         Variables:
-          INPUT_STREAM_NAME: !Ref InputStream
-          DEFAULT_RACE_ID: "f1-sim"
-      Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref IngestLambdaS3Key
+          DDB_TABLE: !Ref CarStateTable
+          TRACK_LENGTH_M: !Ref TrackLengthMeters
+          DEFAULT_RACE_ID: !Sub "${ProjectName}-${StageName}-race"
 
-  ConsumerLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-consumer"
-      Runtime: !Ref ConsumerLambdaRuntime
-      Handler: !Ref ConsumerLambdaHandler
-      Role: !GetAtt ConsumerLambdaRole.Arn
-      Timeout: 15
-      MemorySize: 512
-      Environment:
-        Variables:
-          TABLE_NAME: !Ref CurrentStateTable
-          APPSYNC_URL: !GetAtt GraphQLApi.GraphQLUrl
-          APPSYNC_API_KEY: !GetAtt GraphQLApiKey.ApiKey
-          RACE_ID_DEFAULT: "f1-sim"
-      Code:
-        S3Bucket: !Ref ArtifactBucket
-        S3Key: !Ref ConsumerLambdaS3Key
-
-  ############################
-  # API Gateway (REST) -> Ingest Lambda
-  ############################
-  Api:
-    Type: AWS::ApiGateway::RestApi
-    Properties:
-      Name: !Sub "${ProjectName}-api"
-
-  ApiResourceIngest:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref Api
-      ParentId: !GetAtt Api.RootResourceId
-      PathPart: ingest
-
-  ApiMethodPostIngest:
-    Type: AWS::ApiGateway::Method
-    Properties:
-      RestApiId: !Ref Api
-      ResourceId: !Ref ApiResourceIngest
-      HttpMethod: POST
-      AuthorizationType: NONE
-      Integration:
-        Type: AWS_PROXY
-        IntegrationHttpMethod: POST
-        Uri: !Sub
-          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FnArn}/invocations
-          - { FnArn: !GetAtt IngestLambda.Arn }
-
-  ApiDeployment:
-    Type: AWS::ApiGateway::Deployment
-    DependsOn:
-      - ApiMethodPostIngest
-    Properties:
-      RestApiId: !Ref Api
-
-  ApiStage:
-    Type: AWS::ApiGateway::Stage
-    Properties:
-      RestApiId: !Ref Api
-      DeploymentId: !Ref ApiDeployment
-      StageName: !Ref StageName
-
-  AllowApiInvokeIngestLambda:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref IngestLambda
-      Principal: apigateway.amazonaws.com
-      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/ingest"
-
-  ############################
-  # Kinesis Data Analytics (Flink)
-  ############################
-  FlinkLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub "/aws/kinesisanalytics/${ProjectName}-flink"
-      RetentionInDays: 7
-
-  FlinkLogStream:
-    Type: AWS::Logs::LogStream
-    Properties:
-      LogGroupName: !Ref FlinkLogGroup
-      LogStreamName: app
-
-  FlinkApplication:
-    Type: AWS::KinesisAnalyticsV2::Application
-    Properties:
-      ApplicationName: !Sub "${ProjectName}-flink"
-      RuntimeEnvironment: FLINK-1_15
-      ServiceExecutionRole: !GetAtt KinesisAnalyticsRole.Arn
-      ApplicationConfiguration:
-        ApplicationCodeConfiguration:
-          CodeContent:
-            S3ContentLocation:
-              BucketARN: !Sub "arn:aws:s3:::${ArtifactBucket}"
-              FileKey: !Ref FlinkArtifactS3Key
-          CodeContentType: ZIPFILE
-        EnvironmentProperties:
-          PropertyGroups:
-            - PropertyGroupId: AppProps
-              PropertyMap:
-                INPUT_STREAM_NAME: !Ref InputStream
-                OUTPUT_STREAM_NAME: !Ref OutputStream
-        FlinkApplicationConfiguration:
-          ParallelismConfiguration:
-            ConfigurationType: DEFAULT
-
-  FlinkLoggingOption:
-    Type: AWS::KinesisAnalyticsV2::ApplicationCloudWatchLoggingOption
-    Properties:
-      ApplicationName: !Ref FlinkApplication
-      CloudWatchLoggingOption:
-        LogStreamARN: !GetAtt FlinkLogStream.Arn
-
-  ############################
-  # Kinesis output -> Consumer Lambda trigger
-  ############################
-  ConsumerEventSourceMapping:
+  # Conecta Kinesis -> Lambda
+  KinesisToLambdaMapping:
     Type: AWS::Lambda::EventSourceMapping
     Properties:
-      EventSourceArn: !GetAtt OutputStream.Arn
-      FunctionName: !Ref ConsumerLambda
+      EventSourceArn: !GetAtt TelemetryStream.Arn
+      FunctionName: !Ref LeaderboardLambda
       StartingPosition: LATEST
-      BatchSize: 100
+      BatchSize: 10
       MaximumBatchingWindowInSeconds: 1
       Enabled: true
 
 Outputs:
-  IngestEndpoint:
-    Description: POST sensor events here (JSON or [JSON,...])
-    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/ingest"
+  ApiInvokeUrl:
+    Description: URL POST /telemetry
+    Value: !Sub "https://${TelemetryApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/telemetry"
 
-  InputStreamName:
-    Value: !Ref InputStream
+  ApiKeyValue:
+    Description: API Key (header x-api-key)
+    Value: !Ref TelemetryApiKey
 
-  OutputStreamName:
-    Value: !Ref OutputStream
+  StreamName:
+    Value: !Ref TelemetryStream
 
-  DynamoDBTable:
-    Value: !Ref CurrentStateTable
+  CarStateTableName:
+    Value: !Ref CarStateTable
 
-  AppSyncGraphQLUrl:
-    Value: !GetAtt GraphQLApi.GraphQLUrl
-
-  AppSyncApiKey:
-    Value: !GetAtt GraphQLApiKey.ApiKey
+  LambdaName:
+    Value: !Ref LeaderboardLambda
